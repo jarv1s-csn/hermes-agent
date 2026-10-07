@@ -110,14 +110,44 @@ def test_dirty_tree_blocks_auto_switch(repo_pair):
     assert reason == "dirty"
 
 
-def test_untracked_file_blocks_auto_switch(repo_pair):
-    """Untracked files count as dirty too — they'd ride along on checkout."""
+def test_untracked_file_allows_auto_switch(repo_pair):
+    """Untracked files that the target branch does NOT ship no longer block the
+    auto-switch: the autostash (``--include-untracked``) carries them across the
+    branch switch and restores them after (2026-10-07 incident: a parked checkout
+    with untracked scratch files could never be auto-switched back)."""
     (repo_pair / "scratch.py").write_text("wip\n")
     safe, reason = update_cmd._assess_parked_branch_switch(
         GIT, repo_pair, "old-feature", "main"
     )
+    assert safe is True
+    assert reason == "untracked:1"
+
+
+def test_untracked_file_shipping_in_target_blocks_auto_switch(repo_pair):
+    """An untracked path the target branch ALSO ships would be clobbered (or
+    silently folded into the autostash and replaced by the branch's version on
+    restore) — the switch must refuse with the collision named."""
+    (repo_pair / "b.txt").write_text("local untracked version\n")  # origin/main ships b.txt at c3
+    safe, reason = update_cmd._assess_parked_branch_switch(
+        GIT, repo_pair, "old-feature", "main"
+    )
     assert safe is False
-    assert reason == "dirty"
+    assert reason == "untracked-collisions"
+
+
+def test_untracked_file_inside_untracked_dir_shipped_in_target_blocks(repo_pair):
+    """File-level enumeration (``--untracked-files=all``): an untracked file under
+    a new directory that the target ships is still detected as a collision."""
+    (repo_pair / "notes").mkdir()
+    # origin/main ships b.txt at top level; put the collision deeper to prove the
+    # file-level compare sees through directories.
+    (repo_pair / "notes" / "b.txt").write_text("nope\n")
+    safe, reason = update_cmd._assess_parked_branch_switch(
+        GIT, repo_pair, "old-feature", "main"
+    )
+    # notes/b.txt is not shipped by main -> safe, counted as untracked
+    assert safe is True
+    assert reason == "untracked:1"
 
 
 def test_unmerged_commits_switch_with_kept_notice(repo_pair):

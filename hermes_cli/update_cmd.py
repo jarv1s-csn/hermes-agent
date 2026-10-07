@@ -1031,8 +1031,13 @@ def _apply_parked_branch_guard(
         print(f"⚠ Update finished — code update SKIPPED{_branch_head_suffix(git_cmd, _m().PROJECT_ROOT)}")
         _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
         sys.exit(1)
-    if not switch_block_reason.startswith("unmerged:"):
+    if not switch_block_reason:  # clean tree, fully merged
         print(f"  ⚠ Checkout was parked on '{current_branch}' (fully merged) — switching back to {branch}...")
+        return True, False, switch_block_reason
+    if switch_block_reason.startswith("untracked:"):
+        count = switch_block_reason.split(":", 1)[1]
+        print(f"  ⚠ Checkout was parked on '{current_branch}' with {count} untracked file(s) (none shipped by "
+              f"{branch}) — switching back to {branch}; the autostash carries them across...")
         return True, False, switch_block_reason
     _in_place_configured = False
     with _best_effort('Could not read updates.parked_branch_strategy: %s'):

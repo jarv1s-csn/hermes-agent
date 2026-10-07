@@ -166,6 +166,44 @@ def _branch_head_suffix(git_cmd=None, cwd=None) -> str:
     return f" [{label}]" if label else ""
 
 
+def _untracked_paths(git_cmd: list[str], cwd: Path) -> list[str] | None:
+    """Every untracked path (files and directories, trailing ``/`` kept) or None when unreadable.
+
+    ``status --porcelain`` with ``-z`` and ``--untracked-files=all`` is the NUL-safe form:
+    untracked directories are enumerated per file, so a directory-level entry can never
+    hide a deeper collision in the switch-safety check.
+    """
+    from hermes_cli.update_cmd import _git_run
+    status = _git_run(git_cmd, ["status", "--porcelain", "-z", "--untracked-files=all"], cwd)
+    if status.returncode != 0:
+        return None
+    paths = []
+    for entry in status.stdout.split("\0"):
+        if entry.startswith("?? "):
+            paths.append(entry[3:].strip('"'))
+    return paths
+
+
+def _untracked_switch_collisions(git_cmd: list[str], cwd: Path, target_branch: str, untracked: list[str]) -> list[str] | None:
+    """Untracked paths a checkout to *target_branch* would have to clobber (None: unverifiable).
+
+    A path collides when the target tree ships it (``ls-tree -r``): git would refuse the
+    checkout, or worse, an ``autostash``-first flow would silently fold the untracked file
+    into the stash and materialize the branch's version on restore. Paths the target does
+    not ship are safe — ``git checkout`` leaves them untouched in the worktree. Callers pass
+    ``--untracked-files=all`` output, so *untracked* is file-level and a direct path compare
+    is exhaustive.
+    """
+    from hermes_cli.update_cmd import _git_run
+    if not untracked:
+        return []
+    ls_tree = _git_run(git_cmd, ["ls-tree", "-r", "--name-only", f"origin/{target_branch}"], cwd)
+    if ls_tree.returncode != 0:
+        return None
+    shipped = set(ls_tree.stdout.splitlines())
+    return [p for p in untracked if p in shipped]
+
+
 def _assess_parked_branch_switch(git_cmd: list[str], cwd: Path, current_branch: str, target_branch: str) -> tuple[bool, str]:
     """Decide whether a parked feature branch may be auto-switched back to the update target.
 
@@ -173,6 +211,13 @@ def _assess_parked_branch_switch(git_cmd: list[str], cwd: Path, current_branch: 
     - (True, "unmerged:<n>") — tree clean but commits not in target; switching is safe (checkout keeps
       committed work) but caller must print a LOUD notice. Non-interactive callers (desktop, gateway
       /update, cron) can't resolve a skip, so a clean checkout must reach target.
+    - (True, "untracked:<n>") — tree has ONLY untracked paths and none of them collide with paths the
+      target branch ships: the autostash (``--include-untracked``) carries them across the switch and
+      restores them after. Untracked work was previously counted as "dirty" (blocked) — the exact
+      2026-10-07 incident: a checkout parked on ``main`` with untracked scratch files could not be
+      auto-switched to the update branch at all.
+    - (False, "untracked-collisions") — untracked paths that the target branch also ships; switching
+      would clobber or stash-fold them.
     - (False, "disabled"|"dirty"|"unverifiable") — caller must NOT touch the branch. Dirty is the
       genuinely unsafe case: uncommitted work riding an autostash across branches.
     A config read failure must not disable the safety checks: fall through with the default."""
@@ -187,7 +232,21 @@ def _assess_parked_branch_switch(git_cmd: list[str], cwd: Path, current_branch: 
     status = _git_run(git_cmd, ["status", "--porcelain"], cwd)
     if status.returncode != 0:
         return False, "unverifiable"
-    if status.stdout.strip():
+    if not status.stdout.strip():
+        pass  # clean tree: fall through to the cherry check
+    elif all(line.startswith("??") for line in status.stdout.splitlines() if line.strip()):
+        # Untracked-only tree: safe to switch IFF none of the untracked paths collide
+        # with what the target branch ships. The autostash carries them across.
+        untracked = _untracked_paths(git_cmd, cwd)
+        if untracked is None:
+            return False, "unverifiable"
+        collisions = _untracked_switch_collisions(git_cmd, cwd, target_branch, untracked)
+        if collisions is None:
+            return False, "unverifiable"
+        if collisions:
+            return False, "untracked-collisions"
+        return True, f"untracked:{len(untracked)}"
+    else:
         return False, "dirty"
     cherry = _git_run(git_cmd, ["cherry", f"origin/{target_branch}"], cwd)
     if cherry.returncode != 0:
@@ -198,6 +257,7 @@ def _assess_parked_branch_switch(git_cmd: list[str], cwd: Path, current_branch: 
 
 _PARKED_SKIP_WHY = {
     "dirty": "the working tree has uncommitted changes",
+    "untracked-collisions": "untracked files would be overwritten by the switch to the update branch",
     "disabled": "updates.auto_switch_parked_branch is set to false in config.yaml",
 }
 
