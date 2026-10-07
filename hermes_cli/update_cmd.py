@@ -6,6 +6,7 @@ main -> update_cmd -> update_cmd_*; ``_m()`` resolves ``hermes_cli.main`` at cal
 """
 
 import logging
+import contextlib
 from contextlib import suppress
 import os
 import shlex
@@ -621,6 +622,33 @@ def _source_update_channel(args=None, *, channel=None, branch_explicit=False) ->
     return resolve_update_channel(config, _m().PROJECT_ROOT)
 
 
+def _preflight_warn_only(git_cmd, root: Path, branch: str) -> None:
+    """``--check``-only preview of the apply path's admission failures (never exits).
+
+    Reuses the SAME verdict functions the apply path runs (``_assess_parked_branch_switch``
+    for the parked/dirty/untracked-collision gate, ``pm.plugins_state.read_home_selection``
+    for the config-shape gate that dead-ends source-update preparation), so a green check
+    converges toward "the preflight part of the update will pass". TOCTOU between check and
+    apply is still real — this reports state, not a guarantee.
+    """
+    from hermes_cli import update_cmd_git
+    with contextlib.suppress(Exception):
+        current = _git_run(git_cmd, ["rev-parse", "--abbrev-ref", "HEAD"], root).stdout.strip()
+        if current and current != branch and current != "HEAD":
+            safe, reason = update_cmd_git._assess_parked_branch_switch(git_cmd, root, current, branch)
+            if not safe:
+                update_cmd_git._print_parked_branch_skip_warning(git_cmd, root, current, branch, reason)
+                print("  (preview only — `hermes update` would exit 1 here without applying anything)")
+    with contextlib.suppress(Exception):
+        from hermes_cli.config import get_config_path
+        from pm.plugins_state import read_home_selection
+        try:
+            read_home_selection(get_config_path().parent)
+        except ValueError as exc:
+            print(f"⚠ Config shape check: {exc}")
+            print("  (a real update would dead-end in source-update preparation until fixed)")
+
+
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False, channel=None):
     """Implement ``hermes update --check``: fetch and report without installing.
 
@@ -676,6 +704,11 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False, ch
         sys.exit(1)
     if is_shallow:
         _check.repair_shallow_grafts(root)
+
+    # Same preflight verdicts the apply path runs (parked branch / dirty / untracked
+    # collisions / config shape) — reported, never fatal, so automation sees why an
+    # update WOULD refuse before it pauses any gateway (#117246 preview twin).
+    _preflight_warn_only(git_cmd, root, branch)
 
     if not _check.compare_ref_exists(git_cmd, root, compare_branch):
         print(f"✗ Branch '{branch}' not found on {compare_branch.split('/', 1)[0]}.")
