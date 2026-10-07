@@ -8,6 +8,7 @@ side-effect-free probe, so ``hermes update --plan`` is safe on a live fleet.
 from __future__ import annotations
 
 import logging
+import os
 import shlex
 import sys
 from contextlib import contextmanager, suppress
@@ -43,6 +44,11 @@ class UpdatePlan:
     expected_version: Optional[str] = None
     profiles: list = field(default_factory=list)
     runtimes: list = field(default_factory=list)  # list[RuntimeRecord]
+    # True when a step of THIS update would need a UAC-elevated helper on Windows: pausing an
+    # SCM gateway service (sc.exe stop), the cua-driver scheduled-task refresh, or an
+    # autostart install. A plain user-level gateway (scheduled task / direct spawn) needs none.
+    elevation_required: bool = False
+    elevation_reasons: list = field(default_factory=list)  # human-readable one-liners
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)  # recursive: RuntimeRecord entries become dicts
@@ -304,6 +310,34 @@ def _collect_ledger_runtimes(plan: UpdatePlan, seen: set[int]) -> None:
             ))
 
 
+def _collect_elevation_needs(plan: UpdatePlan) -> None:
+    """Flag the Windows steps of THIS update that would need a UAC-elevated helper.
+
+    An update needs elevation when a gateway runtime is supervised by an SCM service
+    (``windows-service`` — ``sc.exe stop`` on pause and ``sc.exe start`` on resume), or when
+    the optional cua-driver package is installed on Windows (its scheduled-task re-registration
+    requires UAC; the update prints a deferred notice today). Everything else — a user-level
+    scheduled task, direct spawn, desktop-owned backend — runs unelevated. Non-Windows hosts
+    never set the flag.
+    """
+    if sys.platform != "win32":
+        return
+    with _probe("Windows elevation probe"):
+        reasons: list[str] = []
+        for runtime in plan.runtimes:
+            if runtime.supervisor == "windows-service":
+                reasons.append(
+                    f"pausing/restoring the SCM gateway service for profile '{runtime.profile}' (sc.exe) needs admin")
+        with suppress(Exception):
+            import pm
+            if (os.environ.get("HERMES_CUA_DRIVER_CMD", "").strip() == ""
+                    and pm.installed_package("cua-driver", allow_outdated=True) is not None):
+                reasons.append("cua-driver scheduled-task refresh needs admin (otherwise deferred with a notice)")
+        if reasons:
+            plan.elevation_required = True
+            plan.elevation_reasons = reasons
+
+
 def collect_runtime_inventory() -> UpdatePlan:
     """Build the pre-update plan. Read-only; never raises — every collector degrades independently.
 
@@ -326,6 +360,7 @@ def collect_runtime_inventory() -> UpdatePlan:
     seen: set[int] = set()
     _collect_gateway_runtimes(plan, profile_homes, seen)
     _collect_ledger_runtimes(plan, seen)
+    _collect_elevation_needs(plan)
     return plan
 
 
@@ -340,6 +375,13 @@ def print_update_plan(plan: UpdatePlan) -> None:
         print("  ⚠ This install is NOT updatable in place.")
         print(f"    Update via: {plan.update_mechanism}")
     print(f"  Profiles: {', '.join(plan.profiles) if plan.profiles else '(none found)'}")
+    if plan.elevation_required:
+        print("  ⚠ This update needs an elevated (UAC) helper on Windows for:")
+        for reason in plan.elevation_reasons:
+            print(f"    • {reason}")
+        print("    Run it from an elevated terminal, or expect those steps to be deferred with a notice.")
+    else:
+        print("  Elevation: none needed (no SCM gateway service, no cua-driver refresh due)")
     if not plan.runtimes:
         print("  Running Hermes services: none detected — code swap only.")
         return
