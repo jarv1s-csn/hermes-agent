@@ -1008,6 +1008,47 @@ class GatewayAdapterLifecycleMixin:
             if owns_host_lock(ROLE_GATEWAY):
                 from hermes_constants import get_hermes_home
                 publish_record(ROLE_GATEWAY, profiles=tuple(served), home=str(get_hermes_home()))
+        self._flag_incomplete_update_on_boot()
+
+    def _flag_incomplete_update_on_boot(self) -> None:
+        """Light the ``update_needs_attention`` signal when the latest update receipt is unfinished.
+
+        Read-only duty check on the boot path: a failed/refused receipt whose fleet still owes a
+        restart, or a receipt whose expected code no longer matches this checkout, means the last
+        update never converged (code/deps mismatch — exactly the mixed-version fleet the updater's
+        verify phase exists to catch). The gateway NEVER resumes the update itself (a runtime
+        process pulling code is the mixed-sys.modules hazard); it records the signal and logs, so
+        `hermes status` / the dashboard surface it and a human (or the updater, re-run) decides.
+        Signal is cleared on the next successful update receipt — recheck on every boot.
+        """
+        with _log_suppressed(logging.WARNING, "incomplete-update boot check failed", exc_info=True):
+            from gateway.status import publish_runtime_status
+            from hermes_cli.update_receipt import read_latest_receipt
+            receipt = read_latest_receipt() or {}
+            if not receipt:
+                return
+            reasons: list[str] = []
+            outcome = receipt.get("outcome")
+            if outcome not in ("success", None):
+                reasons.append(f"last update outcome: {outcome}")
+            expected_sha = receipt.get("post_update", {}).get("sha") if isinstance(receipt.get("post_update"), dict) else None
+            if expected_sha:
+                from hermes_cli.version_info import get_code_identity
+                running_sha = (get_code_identity(refresh=False) or {}).get("sha")
+                if running_sha and running_sha != expected_sha:
+                    reasons.append("running code differs from the last receipt's post-update sha")
+            if not reasons:
+                # Explicit clear: the "starting" write reloads the previous gateway_state.json
+                # (reload_existing=True), so a stale True from an earlier boot survives into this
+                # process's module state unless the clean verdict overwrites it.
+                publish_runtime_status(update_needs_attention=False, update_attention_reasons=None)
+                return
+            publish_runtime_status(update_needs_attention=True, update_attention_reasons=reasons)
+            logger.warning(
+                "Update needs attention: %s — re-run `hermes update` (or inspect %s). "
+                "The gateway will not resume an update itself.",
+                "; ".join(reasons), "logs/update_receipts/latest.json",
+            )
 
     async def _load_secondary_profile_config(self, profile_name: str, profile_home: "Path"):
         """Hydrate + enter ``profile_home``'s scope once; return its gateway config. Raises

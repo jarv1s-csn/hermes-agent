@@ -1233,6 +1233,7 @@ def _prepare_runtime_status_update(
     ingress_url: Any = _UNSET, listener_base: Any = _UNSET, clear_profile_platforms: bool = False,
     drop_profile_platforms: Optional[str] = None,
     load_existing: bool = True, reload_existing: bool = False,
+    update_needs_attention: Any = _UNSET, update_attention_reasons: Any = _UNSET,
 ) -> tuple[Path, dict[str, Any], dict[str, Any]]:
     """Merge one update into the process-wide canonical status snapshot."""
     global _runtime_status_state_path, _runtime_status_state
@@ -1268,6 +1269,12 @@ def _prepare_runtime_status_update(
             ("served_profiles", served_profiles, lambda v: list(v or [])),
             ("multiplex_standalone_reason", multiplex_standalone_reason, lambda v: str(v) if v else None),
             ("session_store", session_store, _coerce_session_store),
+            # Update-convergence signal (boot-path duty check; the gateway never resumes an update
+            # itself): True with human-readable reasons while the latest update receipt is failed/
+            # refused or its post-update sha no longer matches the running checkout. A successful
+            # update writes the clean state (False / None).
+            ("update_needs_attention", update_needs_attention, bool),
+            ("update_attention_reasons", update_attention_reasons, lambda v: [str(r) for r in v] if v else None),
         ))
         if platform is not _UNSET:
             platform_payload = copy.deepcopy(payload["platforms"].get(platform, {}))
